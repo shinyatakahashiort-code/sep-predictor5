@@ -13,6 +13,7 @@ from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet
 from sklearn.svm import SVR
 from sklearn.neighbors import KNeighborsRegressor
 from sklearn.neural_network import MLPRegressor
+from sklearn.preprocessing import StandardScaler
 import xgboost as xgb
 import lightgbm as lgb
 from catboost import CatBoostRegressor
@@ -249,25 +250,25 @@ def load_models():
     
     # モデルを定義
     model_definitions = {
-        'Linear Regression': LinearRegression(),
-        'Ridge': Ridge(alpha=1.0),
-        'Lasso': Lasso(alpha=0.1),
-        'ElasticNet': ElasticNet(alpha=0.1, l1_ratio=0.5),
-        'Random Forest': RandomForestRegressor(n_estimators=100, random_state=SEED, n_jobs=-1),
-        'Extra Trees': ExtraTreesRegressor(n_estimators=100, random_state=SEED, n_jobs=-1),
-        'Gradient Boosting': GradientBoostingRegressor(n_estimators=100, random_state=SEED),
-        'XGBoost': xgb.XGBRegressor(n_estimators=100, random_state=SEED, n_jobs=-1, verbosity=0),
-        'LightGBM': lgb.LGBMRegressor(n_estimators=100, random_state=SEED, n_jobs=-1, verbose=-1),
-        'CatBoost': CatBoostRegressor(iterations=100, random_state=SEED, verbose=False),
-        'SVR': SVR(kernel='rbf'),
-        'KNN': KNeighborsRegressor(n_neighbors=5),
-        'MLP': MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=1000, random_state=SEED)
+        'Linear Regression': (LinearRegression(), False),
+        'Ridge': (Ridge(alpha=1.0), True),
+        'Lasso': (Lasso(alpha=0.1), True),
+        'ElasticNet': (ElasticNet(alpha=0.1, l1_ratio=0.5), True),
+        'Random Forest': (RandomForestRegressor(n_estimators=100, random_state=SEED, n_jobs=-1), False),
+        'Extra Trees': (ExtraTreesRegressor(n_estimators=100, random_state=SEED, n_jobs=-1), False),
+        'Gradient Boosting': (GradientBoostingRegressor(n_estimators=100, random_state=SEED), False),
+        'XGBoost': (xgb.XGBRegressor(n_estimators=100, random_state=SEED, n_jobs=-1, verbosity=0), False),
+        'LightGBM': (lgb.LGBMRegressor(n_estimators=100, random_state=SEED, n_jobs=-1, verbose=-1), False),
+        'CatBoost': (CatBoostRegressor(iterations=100, random_state=SEED, verbose=False), False),
+        'SVR': (SVR(kernel='rbf'), True),
+        'KNN': (KNeighborsRegressor(n_neighbors=5), True),
+        'MLP': (MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=1000, random_state=SEED), True)
     }
     
     # 保存されたモデルを読み込むか、ダミーデータで訓練
     any_model_loaded = False
     
-    for name, model in model_definitions.items():
+    for name, (model, needs_scaling) in model_definitions.items():
         model_path = f'models/{name.replace(" ", "_")}.pkl'
         
         # 保存されたモデルがあれば読み込む
@@ -282,8 +283,8 @@ def load_models():
         
         # モデルが読み込めなかった場合、ダミーデータで訓練
         # 実際のデータの範囲に基づいたダミーデータを生成
-        np.random.seed(SEED)
-        n_samples = 100
+        np.random.seed(SEED + hash(name) % 1000)  # 各モデルで異なるシードを使用
+        n_samples = 500
         
         X_dummy = pd.DataFrame({
             '年齢': np.random.randint(20, 80, n_samples),
@@ -294,11 +295,25 @@ def load_models():
             'ACD': np.random.uniform(2.0, 4.0, n_samples)
         })
         
-        # ダミーのターゲット変数（SEの範囲: -15 to +5）
-        y_dummy = np.random.uniform(-15, 5, n_samples)
+        # より現実的なターゲット変数を生成（眼軸長との相関を持たせる）
+        y_dummy = (
+            -0.8 * (X_dummy['AL'] - 24.0) +  # 眼軸長との相関
+            0.1 * (X_dummy['K（AVG）'] - 43.5) +
+            0.2 * (X_dummy['LT'] - 4.5) -
+            0.3 * (X_dummy['ACD'] - 3.0) +
+            np.random.normal(0, 1.5, n_samples)
+        )
         
         try:
-            model.fit(X_dummy, y_dummy)
+            if needs_scaling:
+                # スケーリングが必要なモデル
+                scaler = StandardScaler()
+                X_dummy_scaled = scaler.fit_transform(X_dummy)
+                model.fit(X_dummy_scaled, y_dummy)
+            else:
+                # スケーリング不要なモデル
+                model.fit(X_dummy, y_dummy)
+            
             models[name] = model
         except Exception as e:
             st.warning(f"Could not initialize {name}: {str(e)}")
@@ -458,14 +473,26 @@ if input_mode == 'single':
         
         # 全モデルで予測
         predictions = {}
+        failed_models = []
+        
         for model_name in selected_models:
+            if model_name not in models:
+                failed_models.append(f"{model_name} (not loaded)")
+                continue
+                
             try:
                 model = models[model_name]
                 pred = model.predict(input_data)[0]
                 predictions[model_name] = pred
             except Exception as e:
-                st.error(f"Error in {model_name}: {str(e)}")
+                failed_models.append(f"{model_name}: {str(e)}")
                 predictions[model_name] = None
+        
+        # 失敗したモデルがあれば警告表示（エラーではなく）
+        if failed_models:
+            with st.expander("⚠️ Some models failed (click to see details)", expanded=False):
+                for err in failed_models:
+                    st.warning(err)
         
         # ==========================================
         # 結果表示
@@ -606,28 +633,45 @@ else:
                     progress_bar = st.progress(0)
                     
                     # 各モデルの予測を格納
+                    successful_models = []
+                    failed_models = []
+                    
                     for idx, model_name in enumerate(selected_models):
+                        if model_name not in models:
+                            failed_models.append(f"{model_name} (not loaded)")
+                            continue
+                            
                         try:
                             model = models[model_name]
-                            predictions = model.predict(batch_df[required_cols])
-                            batch_df[f'{model_name}_SE'] = predictions
+                            predictions_array = model.predict(batch_df[required_cols])
+                            batch_df[f'{model_name}_SE'] = predictions_array
                             
                             # 分類を追加
-                            classifications = [classify_se(p)[lang] for p in predictions]
+                            classifications = [classify_se(p)[lang] for p in predictions_array]
                             batch_df[f'{model_name}_Classification'] = classifications
                             
+                            successful_models.append(model_name)
                             progress_bar.progress((idx + 1) / len(selected_models))
                         except Exception as e:
-                            st.error(f"Error in {model_name}: {str(e)}")
+                            failed_models.append(f"{model_name}: {str(e)}")
                     
                     progress_bar.empty()
                     
                     # 結果表示
-                    st.success(f"✅ Completed! Processed {len(batch_df)} patients with {len(selected_models)} models.")
+                    if successful_models:
+                        st.success(f"✅ Completed! Processed {len(batch_df)} patients with {len(successful_models)} models.")
+                    else:
+                        st.error("❌ No models succeeded. Please check your data and model configuration.")
+                        st.stop()
                     
-                    # 基本統計
-                    best_model = 'Gradient Boosting'
-                    if f'{best_model}_SE' in batch_df.columns:
+                    if failed_models:
+                        with st.expander("⚠️ Some models failed", expanded=False):
+                            for err in failed_models:
+                                st.warning(err)
+                    
+                    # 基本統計 - 最初の成功したモデルを使用
+                    best_model = successful_models[0] if successful_models else None
+                    if best_model and f'{best_model}_SE' in batch_df.columns:
                         col1, col2, col3, col4 = st.columns(4)
                         
                         se_values = batch_df[f'{best_model}_SE']
